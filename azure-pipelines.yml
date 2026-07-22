@@ -1,0 +1,403 @@
+trigger:
+  branches:
+    include:
+      - '*'
+  paths:
+    exclude:
+      - README.md
+      - docs/*
+
+parameters:
+- name: runMutationTesting
+  displayName: 'Run Mutation Testing'
+  type: boolean
+  default: true
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+- group: 'file-processor-dev'
+- group: 'file-processor-qa'
+- group: 'file-processor-uat'
+- group: 'file-processor-sit'
+- group: 'file-processor-ppd'
+- group: 'file-processor-prod'
+- name: buildConfiguration
+  value: 'Release'
+- name: tag
+  value: '$(Build.BuildId)'
+- name: strykerMutationThreshold
+  value: '80'
+- name: DOTNET_CLI_TELEMETRY_OPTOUT
+  value: '1'
+- name: DOTNET_SKIP_FIRST_TIME_EXPERIENCE
+  value: '1'
+
+stages:
+- stage: BuildAndTest
+  displayName: 'Build and Test'
+  jobs:
+  - job: BuildJob
+    displayName: 'Build File Processor Service'
+    steps:
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore NuGet Packages'
+      inputs:
+        command: 'restore'
+        projects: '**/*.csproj'
+        feedsToUse: 'select'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Build Solution'
+      inputs:
+        command: 'build'
+        projects: '**/*.csproj'
+        arguments: '--configuration $(buildConfiguration) --no-restore'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Run Unit Tests'
+      inputs:
+        command: 'test'
+        projects: '**/*UnitTests.csproj'
+        arguments: '--configuration $(buildConfiguration) --no-build --collect:"XPlat Code Coverage" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.ExcludeByFile="**/*.Generated.cs"'
+        publishTestResults: true
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Run Integration Tests'
+      inputs:
+        command: 'test'
+        projects: '**/*IntegrationTests.csproj'
+        arguments: '--configuration $(buildConfiguration) --no-build --collect:"XPlat Code Coverage" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.ExcludeByFile="**/*.Generated.cs"'
+        publishTestResults: true
+
+    - script: |
+        echo "Searching for coverage files..."
+        find $(Agent.TempDirectory) -name "coverage.cobertura.xml" -type f || echo "No coverage files found"
+      displayName: 'List Coverage Files'
+      continueOnError: true
+
+    - task: PublishCodeCoverageResults@2
+      displayName: 'Publish Code Coverage Results'
+      condition: succeededOrFailed()
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(Agent.TempDirectory)/**/coverage.cobertura.xml'
+        pathToSources: '$(Build.SourcesDirectory)/src'
+        failIfCoverageEmpty: false
+      continueOnError: true
+
+    - script: |
+        if ! command -v reportgenerator &> /dev/null; then
+          echo "Installing ReportGenerator..."
+          dotnet tool install -g dotnet-reportgenerator-globaltool
+        else
+          echo "ReportGenerator already installed"
+        fi
+
+        if ls $(Agent.TempDirectory)/**/coverage.cobertura.xml 1> /dev/null 2>&1; then
+          echo "Generating coverage report..."
+          reportgenerator \
+            -reports:$(Agent.TempDirectory)/**/coverage.cobertura.xml \
+            -targetdir:$(Build.ArtifactStagingDirectory)/CoverageReport \
+            -reporttypes:"HtmlInline_AzurePipelines;Cobertura;Badges"
+          echo "Coverage report generated successfully"
+        else
+          echo "No coverage files found to generate report"
+        fi
+      displayName: 'Generate Code Coverage Report'
+      continueOnError: true
+      condition: succeededOrFailed()
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Coverage Report'
+      condition: and(succeededOrFailed(), eq(variables['Agent.JobStatus'], 'Succeeded'))
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/CoverageReport'
+        artifactName: 'CodeCoverageReport'
+      continueOnError: true
+
+- stage: SecurityScan
+  displayName: 'CheckMarx Security Scan'
+  dependsOn: BuildAndTest
+  jobs:
+  - job: CheckMarxScanJob
+    displayName: 'Run CheckMarx Scan'
+    steps:
+    - task: Checkmarx AST@3
+      inputs:
+        CheckmarxService: '$(checkmarxServiceConnection)'
+        projectName: 'HyperionInsurance/Digital-Backbone/file-processor'
+        branchName: '$(Build.SourceBranchName)'
+        tenantName: 'howden'
+        additionalParams: >
+          --report-format json
+          --output-path $(Agent.TempDirectory)
+
+    - script: |
+        set -e
+        file=$(find "$(Agent.TempDirectory)" -name "*.json" | head -n 1)
+        if [ ! -f "$file" ]; then
+          echo "Checkmarx report not found"; exit 1
+        fi
+
+        if ! jq -e '.results and (.results | type == "array") and (.results | length > 0)' "$file" > /dev/null; then
+          echo "No vulnerabilities found in Checkmarx report."
+          exit 0
+        fi
+
+        IFS=',' read -ra SEVERITIES <<< "$(failOnSeverities)"
+        FAIL=0
+
+        for SEVERITY in "${SEVERITIES[@]}"; do
+          COUNT=$(jq "[.results[] | select(.severity == \"${SEVERITY^^}\")] | length" "$file")
+          echo "${SEVERITY^} findings: $COUNT"
+          if [ "$COUNT" -gt 0 ]; then
+            echo "Failing build: ${SEVERITY^} vulnerabilities detected."
+            FAIL=1
+          fi
+        done
+
+        if [ "$FAIL" -eq 1 ]; then
+          exit 1
+        fi
+      displayName: 'Fail on configured severity findings'
+
+- stage: MutationTesting
+  displayName: 'Mutation Testing'
+  dependsOn: SecurityScan
+  condition: and(succeeded('SecurityScan'), eq('${{ parameters.runMutationTesting }}', 'true'))
+  jobs:
+  - job: StrykerMutationTest
+    displayName: 'Run Stryker.NET Mutation Tests'
+    timeoutInMinutes: 180
+    steps:
+    - task: UseDotNet@2
+      displayName: 'Install .NET SDK'
+      inputs:
+        packageType: 'sdk'
+        version: '10.x'
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Build Solution'
+      inputs:
+        command: 'build'
+        projects: '**/*.csproj'
+        arguments: '--configuration $(buildConfiguration)'
+
+    - script: |
+        set -euo pipefail
+        echo "Installing Stryker.NET..."
+        dotnet tool install --global dotnet-stryker --version 4.14.1
+
+        echo "Installing jq..."
+        sudo apt-get update -qq && sudo apt-get install -y jq > /dev/null 2>&1
+
+        echo "All tools installed successfully"
+      displayName: 'Install Stryker.NET and Dependencies'
+      failOnStderr: false
+
+    - script: |
+        set -euo pipefail
+        chmod +x $(Build.SourcesDirectory)/scripts/run-mutation-tests.sh
+        $(Build.SourcesDirectory)/scripts/run-mutation-tests.sh \
+          "$(Build.ArtifactStagingDirectory)/StrykerOutput" \
+          "$(strykerMutationThreshold)" \
+          "4"
+      displayName: 'Run Mutation Testing'
+      failOnStderr: false
+      env:
+        PATH: $(PATH):$(HOME)/.dotnet/tools
+
+    - script: |
+        chmod +x $(Build.SourcesDirectory)/scripts/generate-mutation-summary.sh
+        $(Build.SourcesDirectory)/scripts/generate-mutation-summary.sh \
+          "$(Build.ArtifactStagingDirectory)/StrykerOutput"
+      displayName: 'Generate Mutation Summary'
+      condition: succeededOrFailed()
+      continueOnError: true
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Mutation Testing Reports'
+      condition: always()
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/StrykerOutput'
+        artifactName: 'MutationTestingReport-$(Build.BuildNumber)'
+        publishLocation: 'pipeline'
+
+- stage: DockerBuildAndPush
+  displayName: 'Docker Build and Push'
+  dependsOn: 
+    - SecurityScan
+    - MutationTesting
+  condition: and(succeeded('BuildAndTest'), in(dependencies.SecurityScan.result, 'Succeeded', 'Skipped'), in(dependencies.MutationTesting.result, 'Succeeded', 'Skipped'))
+  jobs:
+  - job: DockerBuild
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Login to Azure'
+      inputs:
+        azureSubscription: '$(azureSubscriptionProd)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          echo "Logging into ACR $(containerRegistry)"
+          az acr login --name $(containerRegistry)
+          echo "*** Completed! ***"
+
+    - task: Docker@2
+      displayName: 'Build Docker Image'
+      inputs:
+        command: 'build'
+        repository: '$(imageName)'
+        dockerfile: '**/Dockerfile'
+        tags: |
+          $(tag)
+        arguments: '--pull'
+
+    - task: AzureCLI@2            
+      displayName: 'Push to Prod ACR'
+      inputs:
+        azureSubscription: '$(azureSubscriptionProd)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          echo "*** Pushing image: $(imageName) ***"
+          docker tag $(imageName):$(tag) $(containerRegistry)/$(imageName):$(tag)
+          docker image ls
+          docker push $(containerRegistry)/$(imageName):$(tag)
+          echo "*** completed! ***"
+
+- stage: DeployToDev
+  displayName: 'Deploy to Dev environment'
+  dependsOn:
+    - DockerBuildAndPush
+    - SecurityScan
+  jobs:
+  - deployment: DeployToDev
+    environment: 'file-processor-dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Deploy File Processor Service'
+            inputs:
+              azureSubscription: '$(azureSubscriptionDev)'
+              scriptType: bash 
+              scriptLocation: inlineScript
+              azureCLIVersion: latestVersion
+              inlineScript: |
+                az acr login --name $(containerRegistry)
+                az containerapp update --name $(containerAppNameDev) --resource-group $(resourceGroupDev) --image  $(containerRegistry)/$(imageName):$(tag) --set-env-vars "ASPNETCORE_ENVIRONMENT=Dev" 
+
+- stage: DeployToQa
+  displayName: 'Deploy to QA environment'
+  dependsOn: DeployToDev
+  condition: and(succeeded('DeployToDev'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), in(dependencies.DeployToDev.result, 'Succeeded'))
+  jobs:
+  - deployment: DeployToQA
+    environment: 'file-processor-qa'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Deploy File Processor Service'
+            inputs:
+              azureSubscription: '$(azureSubscriptionQa)'
+              scriptType: bash 
+              scriptLocation: inlineScript
+              azureCLIVersion: latestVersion
+              inlineScript: |
+                az acr login --name $(containerRegistry)
+                az containerapp update --name $(containerAppNameQa) --resource-group $(resourceGroupQa) --image  $(containerRegistry)/$(imageName):$(tag) --set-env-vars "ASPNETCORE_ENVIRONMENT=Qa" 
+
+- stage: DeployToUat
+  displayName: 'Deploy to UAT environment'
+  dependsOn: DeployToQa
+  condition: and(succeeded('DeployToQa'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), in(dependencies.DeployToQa.result, 'Succeeded'))
+  jobs:
+  - deployment: DeployToUat
+    environment: 'file-processor-uat'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Deploy File Processor Service'
+            inputs:
+              azureSubscription: '$(azureSubscriptionUat)'
+              scriptType: bash 
+              scriptLocation: inlineScript
+              azureCLIVersion: latestVersion
+              inlineScript: |
+                az acr login --name $(containerRegistry)
+                az containerapp update --name $(containerAppNameUat) --resource-group $(resourceGroupUat) --image  $(containerRegistry)/$(imageName):$(tag) --set-env-vars "ASPNETCORE_ENVIRONMENT=Uat"
+
+- stage: DeployToSit
+  displayName: 'Deploy to SIT environment'
+  dependsOn: DeployToUat
+  condition: and(succeeded('DeployToUat'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), in(dependencies.DeployToUat.result, 'Succeeded'))
+  jobs:
+  - deployment: DeployToSit
+    environment: 'file-processor-sit'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Deploy File Processor Service'
+            inputs:
+              azureSubscription: '$(azureSubscriptionSit)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              azureCLIVersion: latestVersion
+              inlineScript: |
+                az acr login --name $(containerRegistry)
+                az containerapp update --name $(containerAppNameSit) --resource-group $(resourceGroupSit) --image  $(containerRegistry)/$(imageName):$(tag) --set-env-vars "ASPNETCORE_ENVIRONMENT=Sit"
+
+- stage: DeployToPpd
+  displayName: 'Deploy to PPD environment'
+  dependsOn: DeployToSit
+  condition: and(succeeded('DeployToSit'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), in(dependencies.DeployToSit.result, 'Succeeded'))
+  jobs:
+  - deployment: DeployToPpd
+    environment: 'file-processor-ppd'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Deploy File Processor Service'
+            inputs:
+              azureSubscription: '$(azureSubscriptionUat)'
+              scriptType: bash 
+              scriptLocation: inlineScript
+              azureCLIVersion: latestVersion
+              inlineScript: |
+                az acr login --name $(containerRegistry)
+                az containerapp update --name $(containerAppNamePpd) --resource-group $(resourceGroupPpd) --image  $(containerRegistry)/$(imageName):$(tag) --set-env-vars "ASPNETCORE_ENVIRONMENT=Ppd"
+
+- stage: DeployToProd
+  displayName: 'Deploy to Prod environment'
+  dependsOn: DeployToPpd
+  condition: and(succeeded('DeployToPpd'), eq(variables['Build.SourceBranch'], 'refs/heads/main'), in(dependencies.DeployToPpd.result, 'Succeeded'))
+  jobs:
+  - deployment: DeployToProd
+    environment: 'file-processor-prod'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Deploy File Processor Service'
+            inputs:
+              azureSubscription: '$(azureSubscriptionProd)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              azureCLIVersion: latestVersion
+              inlineScript: |
+                az acr login --name $(containerRegistry)
+                az containerapp update --name $(containerAppNameProd) --resource-group $(resourceGroupProd) --image  $(containerRegistry)/$(imageName):$(tag) --set-env-vars "ASPNETCORE_ENVIRONMENT=Prod"
