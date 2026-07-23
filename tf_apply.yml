@@ -1,0 +1,118 @@
+parameters:
+  - name: AllowIPTargets
+    type: object
+    default: []
+  - name: Environment
+    default: ''
+  - name: Change_Infrastructure
+    default: ''
+  - name: ADOOrganizationName
+    default: ''
+  - name: ADOProjectName
+    default: ''
+  - name: TerraformVersion
+    default: ''
+  - name: ResourceGroups
+    type: object
+    default: {}
+  - name: KeyVaultName
+    default: ''
+  - name: SecureFileNames
+    type: object
+    default: []
+  - name: WorkingDirectory
+    default: ''
+  - name: ServiceConnection
+    default: ''
+  - name: BackendFolderPath
+    default: ''
+
+jobs:
+
+- deployment: TFApply
+  ${{ if eq(parameters.Change_Infrastructure, 'Destroy') }}:
+    displayName: Terraform Destroy Apply ${{ parameters.Environment }}
+    dependsOn: [TFPlan]
+    condition: and(succeeded(), eq(dependencies.TFPlan.result, 'Succeeded'), eq('${{ parameters.Change_Infrastructure }}', 'Destroy'), ne('${{ parameters.Environment }}', 'PROD'))
+  ${{ else }}:
+    displayName: Terraform Apply ${{ parameters.Environment }}
+    dependsOn: [TFPlan, ManualValidation]
+    condition: and(ne(dependencies.TFPlan.result, 'Canceled'), eq(dependencies.TFPlan.result, 'Succeeded'), in(dependencies.ManualValidation.result, 'Succeeded', 'Skipped'), eq(dependencies.TFPlan.outputs['SetChangeVariables.HAS_CHANGES'], 'true'), eq('${{ parameters.Change_Infrastructure }}', 'Yes'))
+  environment: ${{ parameters.Environment }}
+
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+
+          - checkout: self
+            fetchDepth: 5
+
+          - checkout: templates
+            fetchDepth: 5
+
+          - checkout: modules
+            fetchDepth: 5
+
+          - template: ..\steps\setup_backend_allow.yml@templates
+            parameters:
+              ServiceConnection: ${{ parameters.ServiceConnection }}
+              Environment: ${{ parameters.Environment }}
+              WorkingDirectory: ${{ parameters.WorkingDirectory }}
+              BackendFolderPath: ${{ parameters.BackendFolderPath }}
+
+          - template: ..\steps\setup_resources_allow.yml@templates
+            parameters:
+              ServiceConnection: ${{ parameters.ServiceConnection }}
+              ResourceGroups: ${{ parameters.ResourceGroups }}
+              AllowIPTargets: ${{ parameters.AllowIPTargets }}
+              WorkingDirectory: ${{ parameters.WorkingDirectory }}
+
+          - download: current
+            ${{ if eq(parameters.Change_Infrastructure, 'Destroy') }}:
+              artifact: tfdestroyplan-$(System.StageName)-$(Build.BuildId)-$(System.StageAttempt)
+              displayName: Download TF Destroy Plan
+            ${{ else }}:
+              artifact: tfplan-$(System.StageName)-$(Build.BuildId)-$(System.StageAttempt)
+              displayName: Download TF Plan
+
+          - template: ..\steps\tf_init.yml@templates
+            parameters:
+              ADOOrganizationName: ${{ parameters.ADOOrganizationName }}
+              ADOProjectName: ${{ parameters.ADOProjectName }}
+              TerraformVersion: ${{ parameters.TerraformVersion }}
+              KeyVaultName: ${{ parameters.KeyVaultName }}
+              SecureFileNames: ${{ parameters.SecureFileNames }}
+              Environment: ${{ parameters.Environment }}
+              WorkingDirectory: ${{ parameters.WorkingDirectory }}
+              ServiceConnection: ${{ parameters.ServiceConnection }}
+
+          - template: ..\steps\tf_apply.yml@templates
+            parameters:
+              WorkingDirectory: ${{ parameters.WorkingDirectory }}
+              ${{ if eq(parameters.Change_Infrastructure, 'Destroy') }}:
+                TFPlanPath: '$(Pipeline.Workspace)\tfdestroyplan-$(System.StageName)-$(Build.BuildId)-$(System.StageAttempt)'
+                OutputFileName: 'tfdestroyplan'
+              ${{ else }}:
+                TFPlanPath: '$(Pipeline.Workspace)\tfplan-$(System.StageName)-$(Build.BuildId)-$(System.StageAttempt)'
+                OutputFileName: 'tfplan'
+              ServiceConnection: ${{ parameters.ServiceConnection }}
+
+          - template: ..\steps\tf_state_unlock.yml@templates
+            parameters:
+              ServiceConnection: ${{ parameters.ServiceConnection }}
+              WorkingDirectory: ${{ parameters.WorkingDirectory }}
+
+          - template: ..\steps\setup_backend_revoke.yml@templates
+            parameters:
+              ServiceConnection: ${{ parameters.ServiceConnection }}
+              Environment: ${{ parameters.Environment }}
+              WorkingDirectory: ${{ parameters.WorkingDirectory }}
+              BackendFolderPath: ${{ parameters.BackendFolderPath }}
+
+          - template: ..\steps\setup_resources_revoke.yml@templates
+            parameters:
+              ServiceConnection: ${{ parameters.ServiceConnection }}
+              ResourceGroups: ${{ parameters.ResourceGroups }}
+              AllowIPTargets: ${{ parameters.AllowIPTargets }}
+              WorkingDirectory: ${{ parameters.WorkingDirectory }}

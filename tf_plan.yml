@@ -1,0 +1,187 @@
+parameters:
+  - name: AllowIPTargets
+    type: object
+    default: []
+  - name: Environment
+    default: ''
+  - name: Change_Infrastructure
+    default: ''
+  - name: ADOOrganizationName
+    default: ''
+  - name: ADOProjectName
+    default: ''
+  - name: TerraformVersion
+    default: ''
+  - name: ResourceGroups
+    type: object
+    default: {}
+  - name: KeyVaultName
+    default: ''
+  - name: SecureFileNames
+    type: object
+    default: []
+  - name: WorkingDirectory
+    default: ''
+  - name: ServiceConnection
+    default: ''
+  - name: BackendFolderPath
+    default: ''
+  - name: AdditionalCommandOptions
+    default: ''
+  - name: DriftFailsPipeline
+    default:
+
+jobs:
+
+- job: TFPlan
+  ${{ if eq(parameters.Change_Infrastructure, 'Destroy') }}:
+    displayName: Terraform Destroy Plan ${{ parameters.Environment }}
+    condition: ne('${{ parameters.Environment }}', 'PROD')
+  ${{ else }}:
+    displayName: Terraform Plan ${{ parameters.Environment }}
+
+  steps:
+    - checkout: self
+      fetchDepth: 5
+
+    - checkout: templates
+      fetchDepth: 5
+
+    - checkout: modules
+      fetchDepth: 5
+
+    - ${{ if eq(parameters.Change_Infrastructure, 'Destroy') }}:
+      - task: PowerShell@2
+        displayName: Update Pipeline Name Destroy
+        condition: not(contains(variables['Build.BuildNumber'], 'Destroy'))
+        inputs:
+          targetType: inline
+          pwsh: true
+          failOnStderr: false
+          showWarnings: true
+          errorActionPreference: stop
+          informationPreference: default
+          verbosePreference: default
+          script: |
+            Write-Host "##vso[build.updatebuildnumber]$(Build.BuildNumber)-Destroy"
+          workingDirectory: ${{ parameters.WorkingDirectory }}
+        env:
+          NO_COLOR: 1
+
+    - ${{ if eq(parameters.Change_Infrastructure, 'No') }}:
+      - task: PowerShell@2
+        displayName: Update Pipeline Name DryRun
+        condition: not(contains(variables['Build.BuildNumber'], 'DryRun'))
+        inputs:
+          targetType: inline
+          pwsh: true
+          failOnStderr: false
+          showWarnings: true
+          errorActionPreference: stop
+          informationPreference: default
+          verbosePreference: default
+          script: |
+            Write-Host "##vso[build.updatebuildnumber]$(Build.BuildNumber)-DryRun"
+          workingDirectory: ${{ parameters.WorkingDirectory }}
+        env:
+          NO_COLOR: 1
+
+    - template: ..\steps\setup_backend_allow.yml@templates
+      parameters:
+        ServiceConnection: ${{ parameters.ServiceConnection }}
+        Environment: ${{ parameters.Environment }}
+        WorkingDirectory: ${{ parameters.WorkingDirectory }}
+        BackendFolderPath: ${{ parameters.BackendFolderPath }}
+
+    - template: ..\steps\setup_resources_allow.yml@templates
+      parameters:
+        ServiceConnection: ${{ parameters.ServiceConnection }}
+        ResourceGroups: ${{ parameters.ResourceGroups }}
+        AllowIPTargets: ${{ parameters.AllowIPTargets }}
+        WorkingDirectory: ${{ parameters.WorkingDirectory }}
+
+    - template: ..\steps\tf_init.yml@templates
+      parameters:
+        ADOOrganizationName: ${{ parameters.ADOOrganizationName }}
+        ADOProjectName: ${{ parameters.ADOProjectName }}
+        TerraformVersion: ${{ parameters.TerraformVersion }}
+        KeyVaultName: ${{ parameters.KeyVaultName }}
+        SecureFileNames: ${{ parameters.SecureFileNames }}
+        Environment: ${{ parameters.Environment }}
+        WorkingDirectory: ${{ parameters.WorkingDirectory }}
+        ServiceConnection: ${{ parameters.ServiceConnection }}
+
+    - ${{ if ne(parameters.Change_Infrastructure, 'Destroy') }}:
+      - template: ..\steps\tf_plan.yml@templates
+        parameters:
+          WorkingDirectory: ${{ parameters.WorkingDirectory }}
+          ServiceConnection: ${{ parameters.ServiceConnection }}
+          Change_Infrastructure: ${{ parameters.Change_Infrastructure }}
+          ${{ if eq(parameters.AdditionalCommandOptions, '') }}:
+            AdditionalCommandOptions: '-refresh-only -detailed-exitcode'
+          ${{ else }}:
+            AdditionalCommandOptions: '-refresh-only -detailed-exitcode ${{ parameters.AdditionalCommandOptions }}'
+          Environment: ${{ parameters.Environment }}
+          OutputFileName: 'tfplan_drift'
+          DisplayName: 'TF Plan Drift Check'
+
+      - template: ..\steps\tf_show.yml@templates
+        parameters:
+          WorkingDirectory: ${{ parameters.WorkingDirectory }}
+          OutputFileName: 'tfplan_drift'
+          DisplayName: 'TF Show Drift Check'
+
+      - template: ..\steps\pipeline_banners.yml@templates
+        parameters:
+          WorkingDirectory: ${{ parameters.WorkingDirectory }}
+          Environment: ${{ parameters.Environment }}
+          DriftFailsPipeline: ${{ parameters.DriftFailsPipeline }}
+
+    - template: ..\steps\tf_plan.yml@templates
+      parameters:
+        WorkingDirectory: ${{ parameters.WorkingDirectory }}
+        ServiceConnection: ${{ parameters.ServiceConnection }}
+        Change_Infrastructure: ${{ parameters.Change_Infrastructure }}
+        AdditionalCommandOptions: ${{ parameters.AdditionalCommandOptions }}
+        Environment: ${{ parameters.Environment }}
+        ${{ if eq(parameters.Change_Infrastructure, 'Destroy') }}:
+          DisplayName: 'TF Destroy Plan'
+          OutputFileName: 'tfdestroyplan'
+        ${{ else }}:
+          DisplayName: 'TF Plan'
+          OutputFileName: 'tfplan'
+
+    - ${{ if ne(parameters.Change_Infrastructure, 'Destroy') }}:
+      - template: ..\steps\tf_show.yml@templates
+        parameters:
+          WorkingDirectory: ${{ parameters.WorkingDirectory }}
+          OutputFileName: 'tfplan'
+          DisplayName: 'TF Show'
+
+      - template: ..\steps\tf_graph.yml@templates
+        parameters:
+          WorkingDirectory: ${{ parameters.WorkingDirectory }}
+
+      - template: ..\steps\check_delete.yml@templates
+        parameters:
+          OutputFileName: 'tfplan'
+          WorkingDirectory: ${{ parameters.WorkingDirectory }}
+
+    - template: ..\steps\tf_state_unlock.yml@templates
+      parameters:
+        ServiceConnection: ${{ parameters.ServiceConnection }}
+        WorkingDirectory: ${{ parameters.WorkingDirectory }}
+
+    - template: ..\steps\setup_backend_revoke.yml@templates
+      parameters:
+        ServiceConnection: ${{ parameters.ServiceConnection }}
+        Environment: ${{ parameters.Environment }}
+        WorkingDirectory: ${{ parameters.WorkingDirectory }}
+        BackendFolderPath: ${{ parameters.BackendFolderPath }}
+
+    - template: ..\steps\setup_resources_revoke.yml@templates
+      parameters:
+        ServiceConnection: ${{ parameters.ServiceConnection }}
+        ResourceGroups: ${{ parameters.ResourceGroups }}
+        AllowIPTargets: ${{ parameters.AllowIPTargets }}
+        WorkingDirectory: ${{ parameters.WorkingDirectory }}
