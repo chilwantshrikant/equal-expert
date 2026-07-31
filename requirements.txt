@@ -3,3 +3,38 @@ requests==2.31.0
 pytest==7.4.3
 pytest-cov==4.1.0
 Werkzeug==3.0.1
+
+
+Service Connections
+Service Connections are used by Azure Devops pipelines to authenticate to various resources, often Azure.
+Service Connections for use with Azure and other Entra ID linked services are either backed by an App Registration or a User Assigned Managed Identity.
+Federated Credentials should be used wherever possible.
+
+You can learn more about Service Connections here.
+
+Service Connections can be requested through EA Support and the Azure Devops team.
+Use the below template, replacing the %variables% with appropriate info.
+
+Template
+To: easupport@howdengrp.com
+Subject: Azure Devops Service Connection: %Ado Project Name%
+Body:
+#######FAO: Devops Team#######
+
+Hi Devops Team,
+
+Please provide new Service Connection(s) for my Devops project.
+
+Service Connection name: SC-ADO-%ProjectName%-%env%
+Scope: %Subscription name/Resource Group name%.
+Devops Project URL: %https://dev.azure.com/....`%
+Default permissions:
+
+Contributor
+User access administrator
+Key Vault Contributor
+Key Vault Secrets Officer
+Key Vault Certificates Officer
+Key Vault Crypto Officer
+Thanks
+...
