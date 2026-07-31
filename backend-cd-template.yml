@@ -1,0 +1,227 @@
+# Reusable Container Apps deploy stage. Calling pipelines (in other repos) must declare this
+# repo as a repository resource named 'infra':
+#
+#   resources:
+#     repositories:
+#       - repository: infra
+#         type: git
+#         name: Howden-ils-Infra
+#
+# Infra-owned values (compute resource group, Container Apps environment, shared ACR) are NOT
+# passed in as parameters — they're read at runtime from environments/{environment}.json in
+# this repo, which is the single source of truth for those values.
+#
+# azureSubscription is the one exception: Azure DevOps must resolve a service connection's
+# authorization BEFORE a job starts, so it can't be set from a variable a script step assigns
+# at runtime — it has to stay a real parameter, resolved at compile time.
+#
+# The Container Apps manifest itself (manifestPath) lives in the CALLING repo, not here —
+# it's read via 'checkout: self', since its content (port, health paths, env vars) is
+# specific to each service, not shared infra config.
+#
+# imageTag accepts a sentinel value of blank or 'latest' (the ADO "Run pipeline" UI won't submit
+# a truly empty string for a required-looking text field, so 'latest' is the practical default).
+# When imageTag is blank/'latest' AND fetchLatestRcIfBlank is true, the newest 'rc-*' tag in the
+# ACR repository is deployed instead — the intended flow for uat/prod promotion of a release
+# candidate. Any other explicit imageTag value always takes precedence over that lookup.
+parameters:
+  - name: environment
+    type: string
+  - name: imageTag
+    type: string
+    default: ''
+  - name: fetchLatestRcIfBlank
+    type: boolean
+    default: false
+  - name: serviceName
+    type: string
+  - name: containerAppName
+    type: string
+  - name: dockerImageName
+    type: string
+  - name: aspnetEnvironment
+    type: string
+  - name: manifestPath
+    type: string
+  - name: azureSubscription
+    type: string
+  - name: requireApproval
+    type: boolean
+    default: false
+  - name: approvalNotifyUsers
+    type: string
+    default: ''
+
+stages:
+  - stage: Deploy_${{ parameters.environment }}
+    displayName: 'Deploy ${{ parameters.serviceName }} - ${{ parameters.environment }}'
+    jobs:
+      - ${{ if eq(parameters.requireApproval, true) }}:
+          - job: Approval
+            displayName: 'Manual approval'
+            pool: server
+            timeoutInMinutes: 1440
+            steps:
+              - task: ManualValidation@0
+                displayName: 'Await approval to deploy to ${{ parameters.environment }}'
+                timeoutInMinutes: 1440
+                inputs:
+                  notifyUsers: ${{ parameters.approvalNotifyUsers }}
+                  instructions: |
+                    Review and approve deployment of ${{ parameters.serviceName }} to ${{ parameters.environment }}.
+                  onTimeout: reject
+
+      - deployment: DeployContainerApp
+        displayName: 'Deploy to ${{ parameters.environment }}'
+        ${{ if eq(parameters.requireApproval, true) }}:
+          dependsOn: Approval
+        environment: '${{ parameters.environment }}'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                # Both repos get explicit paths, referenced below via $(Pipeline.Workspace)/<repo>
+                # rather than a relative path — multi-checkout working-directory defaults have
+                # proven unreliable here. Each script also falls back to searching the workspace
+                # if the expected path is wrong, so a bad assumption fails with a clear location
+                # instead of a blind "not found".
+                - checkout: self
+                  path: app
+
+                - checkout: infra
+                  path: infra
+
+                - script: |
+                    set -euo pipefail
+                    ENV_JSON="$(Pipeline.Workspace)/infra/environments/${{ parameters.environment }}.json"
+
+                    if [ ! -f "$ENV_JSON" ]; then
+                      echo "##[warning]Expected file not found at $ENV_JSON — searching workspace for it instead:"
+                      find "$(Pipeline.Workspace)" -maxdepth 4 -type d 2>/dev/null
+                      FOUND=$(find "$(Pipeline.Workspace)" -type f -name "${{ parameters.environment }}.json" -path "*/environments/*" 2>/dev/null | head -n 1)
+                      if [ -n "$FOUND" ]; then
+                        echo "Found it at: $FOUND"
+                        ENV_JSON="$FOUND"
+                      else
+                        echo "##vso[task.logissue type=error]No environment file found anywhere under $(Pipeline.Workspace)"
+                        exit 1
+                      fi
+                    fi
+
+                    RESOURCE_GROUP=$(jq -r '.container_apps.resource_group_name' "$ENV_JSON")
+                    CAE_NAME=$(jq -r '.container_apps.environment_name' "$ENV_JSON")
+                    CONTAINER_REGISTRY=$(jq -r '.container_apps.container_registry' "$ENV_JSON")
+
+                    echo "Resolved from $ENV_JSON: resourceGroup=$RESOURCE_GROUP containerAppsEnv=$CAE_NAME registry=$CONTAINER_REGISTRY"
+
+                    echo "##vso[task.setvariable variable=resourceGroup]$RESOURCE_GROUP"
+                    echo "##vso[task.setvariable variable=containerAppsEnvironmentName]$CAE_NAME"
+                    echo "##vso[task.setvariable variable=containerRegistry]$CONTAINER_REGISTRY"
+                  displayName: 'Resolve environment config from infra repo'
+
+                - task: AzureCLI@2
+                  displayName: 'Render and apply Container Apps manifest'
+                  inputs:
+                    azureSubscription: '${{ parameters.azureSubscription }}'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      az extension add --name containerapp --upgrade --only-show-errors
+
+                      FETCH_LATEST_RC_IF_BLANK="${{ parameters.fetchLatestRcIfBlank }}"
+                      RESOLVED_IMAGE_TAG="${{ parameters.imageTag }}"
+                      if [ -z "$RESOLVED_IMAGE_TAG" ] || [ "$RESOLVED_IMAGE_TAG" = "latest" ]; then
+                        if [ "$(echo "$FETCH_LATEST_RC_IF_BLANK" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+                          echo "No imageTag provided — fetching latest rc-* tag from ACR repository '${{ parameters.dockerImageName }}'..."
+                          RESOLVED_IMAGE_TAG=$(az acr repository show-tags \
+                            --name "$(containerRegistry)" \
+                            --repository "${{ parameters.dockerImageName }}" \
+                            --orderby time_desc \
+                            --output tsv \
+                            | grep '^rc-' | head -n 1 || true)
+                          if [ -z "$RESOLVED_IMAGE_TAG" ]; then
+                            echo "##vso[task.logissue type=error]No rc-* tag found in ACR repository '${{ parameters.dockerImageName }}', and no imageTag parameter was provided."
+                            exit 1
+                          fi
+                          echo "Resolved latest RC tag: $RESOLVED_IMAGE_TAG"
+                        else
+                          echo "##vso[task.logissue type=error]imageTag is required for environment '${{ parameters.environment }}'."
+                          exit 1
+                        fi
+                      fi
+
+                      echo "Deploying image tag: $RESOLVED_IMAGE_TAG"
+
+                      SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                      MANAGED_ENV_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/$(resourceGroup)/providers/Microsoft.App/managedEnvironments/$(containerAppsEnvironmentName)"
+
+                      RENDERED_MANIFEST="$(Agent.TempDirectory)/containerapp-rendered.yaml"
+
+                      MANIFEST_SOURCE="$(Pipeline.Workspace)/app/${{ parameters.manifestPath }}"
+                      if [ ! -f "$MANIFEST_SOURCE" ]; then
+                        echo "##[warning]Expected manifest not found at $MANIFEST_SOURCE — searching workspace for it instead:"
+                        FOUND=$(find "$(Pipeline.Workspace)" -type f -name "$(basename "${{ parameters.manifestPath }}")" 2>/dev/null | head -n 1)
+                        if [ -n "$FOUND" ]; then
+                          echo "Found it at: $FOUND"
+                          MANIFEST_SOURCE="$FOUND"
+                        else
+                          echo "##vso[task.logissue type=error]No manifest file found anywhere under $(Pipeline.Workspace)"
+                          exit 1
+                        fi
+                      fi
+
+                      sed \
+                        -e "s|__CONTAINER_APPS_ENVIRONMENT_ID__|$MANAGED_ENV_ID|g" \
+                        -e "s|__CONTAINER_REGISTRY__|$(containerRegistry)|g" \
+                        -e "s|__IMAGE_NAME__|${{ parameters.dockerImageName }}|g" \
+                        -e "s|__IMAGE_TAG__|$RESOLVED_IMAGE_TAG|g" \
+                        -e "s|__ASPNETCORE_ENVIRONMENT__|${{ parameters.aspnetEnvironment }}|g" \
+                        "$MANIFEST_SOURCE" > "$RENDERED_MANIFEST"
+
+                      echo "Rendered manifest for ${{ parameters.environment }}:"
+                      cat "$RENDERED_MANIFEST"
+
+                      # 'containerapp create --yaml' has known issues provisioning identity/registry
+                      # config correctly on first creation. Documented workaround: create the app with
+                      # plain CLI flags (lets Azure set up the system identity properly), then apply the
+                      # full manifest via 'update --yaml' — which is the reliable path for both new and
+                      # existing apps.
+                      if az containerapp show --name "${{ parameters.containerAppName }}" --resource-group "$(resourceGroup)" &> /dev/null; then
+                        echo "Container App already exists."
+                      else
+                        echo "Creating new Container App with minimal CLI flags..."
+                        az containerapp create \
+                          --name "${{ parameters.containerAppName }}" \
+                          --resource-group "$(resourceGroup)" \
+                          --environment "$MANAGED_ENV_ID" \
+                          --image "$(containerRegistry).azurecr.io/${{ parameters.dockerImageName }}:$RESOLVED_IMAGE_TAG" \
+                          --target-port 8084 \
+                          --ingress external \
+                          --system-assigned \
+                          --registry-server "$(containerRegistry).azurecr.io" \
+                          --registry-identity system \
+                          --min-replicas 1 \
+                          --max-replicas 3
+                      fi
+
+                      # Confirm AcrPull every run, not just on first creation — if a prior attempt
+                      # failed (e.g. the pipeline's service principal lacked roleAssignments/write
+                      # permission), this retries on every deploy instead of failing silently forever.
+                      # Idempotent: safe to re-run.
+                      echo "Confirming AcrPull role for the Container App's managed identity..."
+                      PRINCIPAL_ID=$(az containerapp show --name "${{ parameters.containerAppName }}" --resource-group "$(resourceGroup)" --query identity.principalId -o tsv)
+                      ACR_ID=$(az acr show --name "$(containerRegistry)" --query id -o tsv)
+
+                      az role assignment create \
+                        --assignee-object-id "$PRINCIPAL_ID" \
+                        --assignee-principal-type ServicePrincipal \
+                        --role AcrPull \
+                        --scope "$ACR_ID" \
+                        || echo "Role assignment may already exist, or this identity lacks permission to grant it — continuing..."
+
+                      echo "Applying full manifest..."
+                      az containerapp update --name "${{ parameters.containerAppName }}" --resource-group "$(resourceGroup)" --yaml "$RENDERED_MANIFEST"

@@ -1,0 +1,304 @@
+# Reusable .NET build/test/security-scan/docker-build-and-push pipeline template.
+# Calling pipelines (in other repos) must declare this repo as a repository resource named
+# 'infra' so the `@infra` template reference below can resolve this file:
+#
+#   resources:
+#     repositories:
+#       - repository: infra
+#         type: git
+#         name: Howden-ils-Infra
+#
+# Nothing in this template's own steps checks out that repo's working tree — deliberately,
+# since a job with more than one checkout puts EVERY repo (including self) into a subfolder
+# instead of self living at $(Build.SourcesDirectory) directly, which breaks GitVersion and
+# path-relative steps like the Docker build. Keep this template single-repo (self only).
+parameters:
+  - name: serviceName
+    type: string
+  - name: solution
+    type: string
+  - name: unitTestProjects
+    type: string
+    default: '**/*Tests.csproj'
+  - name: runIntegrationTests
+    type: boolean
+    default: false
+  - name: integrationTestProjects
+    type: string
+    default: '**/*IntegrationTests.csproj'
+  - name: buildConfiguration
+    type: string
+    default: 'Release'
+  - name: securityScanEnabled
+    type: boolean
+    default: true
+  - name: checkmarxServiceConnection
+    type: string
+    default: '$(checkmarxServiceConnection)'
+  - name: checkmarxProjectName
+    type: string
+    default: ''
+  - name: checkmarxTenantName
+    type: string
+    default: 'howden'
+  - name: checkmarxAdditionalParams
+    type: string
+    default: |-
+      --report-format json
+      --output-path $(Agent.TempDirectory)
+  - name: failOnSeverities
+    type: string
+    default: 'High,Critical'
+  - name: dockerBuildAndPushEnabled
+    type: boolean
+    default: true
+  - name: azureSubscription
+    type: string
+    default: ''
+  - name: containerRegistry
+    type: string
+    default: ''
+  - name: dockerImageName
+    type: string
+    default: '$(Build.Repository.Name)'
+  - name: dockerfilePath
+    type: string
+    default: 'Dockerfile'
+  - name: dockerContext
+    type: string
+    default: '.'
+  - name: dockerAdditionalBuildArgs
+    type: string
+    default: ''
+  - name: enableCodeCoverage
+    type: boolean
+    default: true
+  - name: coverageExcludePattern
+    type: string
+    default: '**/*.Generated.cs'
+  - name: coverageArtifactName
+    type: string
+    default: 'CodeCoverageReport'
+  - name: dotnetSdkVersion
+    type: string
+    default: '10.x'
+  - name: vmImage
+    type: string
+    default: 'ubuntu-latest'
+
+stages:
+ - stage: BuildAndTest
+   displayName: 'Build and Test - ${{ parameters.serviceName }}'
+   jobs:
+     - job: Build
+       displayName: 'Build and Test'
+       pool:
+         vmImage: '${{ parameters.vmImage }}'
+       steps:
+         - task: UseDotNet@2
+           displayName: 'Install .NET SDK'
+           inputs:
+             packageType: 'sdk'
+             version: '${{ parameters.dotnetSdkVersion }}'
+
+         - task: DotNetCoreCLI@2
+           displayName: 'Restore NuGet packages'
+           inputs:
+             command: 'restore'
+             projects: '${{ parameters.solution }}'
+
+         - task: DotNetCoreCLI@2
+           displayName: 'Build solution'
+           inputs:
+             command: 'build'
+             projects: '${{ parameters.solution }}'
+             arguments: '--configuration ${{ parameters.buildConfiguration }} --no-restore'
+
+         - task: DotNetCoreCLI@2
+           displayName: 'Run unit tests'
+           inputs:
+             command: 'test'
+             projects: '${{ parameters.unitTestProjects }}'
+             arguments: '--configuration ${{ parameters.buildConfiguration }} --no-build --collect:"XPlat Code Coverage" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.ExcludeByFile="${{ parameters.coverageExcludePattern }}"'
+             publishTestResults: true
+
+         - ${{ if eq(parameters.runIntegrationTests, true) }}:
+           - task: DotNetCoreCLI@2
+             displayName: 'Run integration tests'
+             inputs:
+               command: 'test'
+               projects: '${{ parameters.integrationTestProjects }}'
+               arguments: '--configuration ${{ parameters.buildConfiguration }} --no-build --collect:"XPlat Code Coverage" -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.ExcludeByFile="${{ parameters.coverageExcludePattern }}"'
+               publishTestResults: true
+
+         - ${{ if eq(parameters.enableCodeCoverage, true) }}:
+           - script: |
+               echo "Searching for coverage files..."
+               find "$(Agent.TempDirectory)" -name "coverage.cobertura.xml" -type f || echo "No coverage files found"
+             displayName: 'List coverage files'
+             continueOnError: true
+
+           - task: PublishCodeCoverageResults@2
+             displayName: 'Publish Code Coverage Results'
+             condition: succeededOrFailed()
+             inputs:
+               codeCoverageTool: 'Cobertura'
+               summaryFileLocation: '$(Agent.TempDirectory)/**/coverage.cobertura.xml'
+               pathToSources: '$(Build.SourcesDirectory)'
+               failIfCoverageEmpty: false
+             continueOnError: true
+
+           - script: |
+               if ! command -v reportgenerator &> /dev/null; then
+                 echo "Installing ReportGenerator..."
+                 dotnet tool install -g dotnet-reportgenerator-globaltool
+               else
+                 echo "ReportGenerator already installed"
+               fi
+
+               if ls $(Agent.TempDirectory)/**/coverage.cobertura.xml 1> /dev/null 2>&1; then
+                 echo "Generating coverage report..."
+                 reportgenerator \
+                   -reports:$(Agent.TempDirectory)/**/coverage.cobertura.xml \
+                   -targetdir:$(Build.ArtifactStagingDirectory)/CoverageReport \
+                   -reporttypes:"HtmlInline_AzurePipelines;Cobertura;Badges"
+                 echo "Coverage report generated successfully"
+               else
+                 echo "No coverage files found to generate report"
+               fi
+             displayName: 'Generate Code Coverage Report'
+             condition: succeededOrFailed()
+             continueOnError: true
+
+           - task: PublishPipelineArtifact@1
+             displayName: 'Publish Coverage Report'
+             condition: and(succeededOrFailed(), eq(variables['Agent.JobStatus'], 'Succeeded'))
+             inputs:
+               targetPath: '$(Build.ArtifactStagingDirectory)/CoverageReport'
+               artifactName: '${{ parameters.coverageArtifactName }}'
+             continueOnError: true
+
+ - stage: SecurityScan
+   displayName: 'CheckMarx Security Scan'
+   dependsOn: BuildAndTest
+   condition: and(succeeded('BuildAndTest'), eq('${{ parameters.securityScanEnabled }}', 'true'))
+   jobs:
+    - job: CheckMarxScanJob
+      displayName: 'Run CheckMarx Scan'
+      pool:
+        vmImage: '${{ parameters.vmImage }}'
+      steps:
+      # POC MOCK — no Checkmarx tenant/credentials available yet.
+      # Replace this script with the real 'Checkmarx AST@3' task (see git history / commented block)
+      # once a service connection is provisioned.
+      - script: |
+          set -e
+          echo "MOCK: simulating a Checkmarx AST report (no real scan performed)."
+          mkdir -p "$(Agent.TempDirectory)"
+          cat > "$(Agent.TempDirectory)/checkmarx-report.json" <<'EOF'
+          {
+            "results": [
+              { "severity": "LOW", "id": "MOCK-002", "description": "Mocked finding for POC testing" }
+            ]
+          }
+          EOF
+        displayName: '[MOCK] Simulate Checkmarx AST scan'
+
+      - script: |
+          set -e
+          file=$(find "$(Agent.TempDirectory)" -name "*.json" | head -n 1)
+          if [ ! -f "$file" ]; then
+            echo "Checkmarx report not found"; exit 1
+          fi
+
+          if ! jq -e '.results and (.results | type == "array") and (.results | length > 0)' "$file" > /dev/null; then
+            echo "No vulnerabilities found in Checkmarx report."
+            exit 0
+          fi
+
+          IFS=',' read -ra SEVERITIES <<< "${{ parameters.failOnSeverities }}"
+          FAIL=0
+
+          for SEVERITY in "${SEVERITIES[@]}"; do
+            COUNT=$(jq "[.results[] | select(.severity == \"${SEVERITY^^}\")] | length" "$file")
+            echo "${SEVERITY^} findings: $COUNT"
+            if [ "$COUNT" -gt 0 ]; then
+              echo "Failing build: ${SEVERITY^} vulnerabilities detected."
+              FAIL=1
+            fi
+          done
+
+          if [ "$FAIL" -eq 1 ]; then
+            exit 1
+          fi
+        displayName: 'Fail on configured severity findings'
+
+ - stage: DockerBuildAndPush
+   displayName: 'Docker Build and Push - ${{ parameters.serviceName }}'
+   dependsOn:
+     - BuildAndTest
+     - SecurityScan
+   condition: and(
+     succeeded('BuildAndTest'),
+     or(not(eq('${{ parameters.securityScanEnabled }}', 'true')), in(dependencies.SecurityScan.result, 'Succeeded', 'Skipped')),
+     eq('${{ parameters.dockerBuildAndPushEnabled }}', 'true'))
+   jobs:
+     - job: DockerBuild
+       displayName: 'Build and Push Docker Image'
+       pool:
+         vmImage: '${{ parameters.vmImage }}'
+       steps:
+         - checkout: self
+           fetchDepth: 0
+
+         - task: gitversion-setup@4.7.0
+           displayName: 'Install GitVersion'
+           inputs:
+             versionSpec: '6.x'
+
+         - task: gitversion-execute@4.7.0
+           displayName: 'Run GitVersion'
+
+         - script: |
+             set -euo pipefail
+             SOURCE_BRANCH="$(Build.SourceBranch)"
+             SOURCE_VERSION="$(Build.SourceVersion)"
+             SEMVER="${GITVERSION_SEMVER:?GITVERSION_SEMVER not set}"
+
+             if [[ "$SOURCE_BRANCH" == refs/heads/main ]]; then
+               TAG="$SEMVER"
+             elif [[ "$SOURCE_BRANCH" == refs/tags/* ]]; then
+               TAG="rc-$SEMVER"
+             else
+               TAG="fea-${SOURCE_VERSION:0:8}"
+             fi
+
+             echo "Resolved image tag: $TAG"
+             echo "##vso[task.setvariable variable=imageTag]$TAG"
+           displayName: 'Resolve Docker image tag'
+
+         - task: AzureCLI@2
+           displayName: 'Login to Azure'
+           inputs:
+             azureSubscription: '${{ parameters.azureSubscription }}'
+             scriptType: bash
+             scriptLocation: inlineScript
+             inlineScript: |
+               echo "Logging into ACR ${{ parameters.containerRegistry }}"
+               az acr login --name ${{ parameters.containerRegistry }}
+
+         - script: |
+             set -euo pipefail
+             echo "Building Docker image with tag: $(imageTag)"
+             docker build \
+               --file "${{ parameters.dockerfilePath }}" \
+               --tag "${{ parameters.containerRegistry }}.azurecr.io/${{ parameters.dockerImageName }}:$(imageTag)" \
+               ${{ parameters.dockerAdditionalBuildArgs }} \
+               "${{ parameters.dockerContext }}"
+           displayName: 'Build Docker image'
+
+         - script: |
+             set -euo pipefail
+             echo "Pushing Docker image with tag: $(imageTag)"
+             docker push "${{ parameters.containerRegistry }}.azurecr.io/${{ parameters.dockerImageName }}:$(imageTag)"
+           displayName: 'Push Docker image'

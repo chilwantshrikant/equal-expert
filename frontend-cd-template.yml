@@ -1,0 +1,205 @@
+# Reusable Web App (App Service for Containers) deploy stage — the frontend counterpart to
+# backend-cd-template.yml. Same design: infra-owned values (resource group, App Service plan,
+# shared ACR) come from environments/{environment}.json in this repo at runtime, not as
+# parameters; azureSubscription stays a real parameter since Azure DevOps must resolve service
+# connection authorization before the job starts; imageTag accepts blank/'latest' as a sentinel
+# meaning "use the newest rc-* tag in ACR" when fetchLatestRcIfBlank is true (uat/prod); requireApproval
+# inserts the same ManualValidation gate used for backend prod deploys.
+#
+# Unlike Container Apps, there's no single declarative --yaml manifest for Web Apps, so config
+# is applied via a sequence of `az webapp config` calls instead — no app-repo checkout needed
+# here at all (nothing to read from the calling repo).
+#
+# Calling pipelines (in other repos) must declare this repo as a repository resource named
+# 'infra':
+#
+#   resources:
+#     repositories:
+#       - repository: infra
+#         type: git
+#         name: Howden-ils-Infra
+parameters:
+  - name: environment
+    type: string
+  - name: imageTag
+    type: string
+    default: ''
+  - name: fetchLatestRcIfBlank
+    type: boolean
+    default: false
+  - name: serviceName
+    type: string
+  - name: webAppName
+    type: string
+  - name: dockerImageName
+    type: string
+  - name: azureSubscription
+    type: string
+  - name: requireApproval
+    type: boolean
+    default: false
+  - name: approvalNotifyUsers
+    type: string
+    default: ''
+  - name: cellServiceUrl
+    type: string
+  - name: fundingServiceUrl
+    type: string
+  - name: auditServiceUrl
+    type: string
+  - name: authServiceUrl
+    type: string
+  - name: documentServiceUrl
+    type: string
+
+stages:
+  - stage: Deploy_${{ parameters.environment }}
+    displayName: 'Deploy ${{ parameters.serviceName }} - ${{ parameters.environment }}'
+    jobs:
+      - ${{ if eq(parameters.requireApproval, true) }}:
+          - job: Approval
+            displayName: 'Manual approval'
+            pool: server
+            timeoutInMinutes: 1440
+            steps:
+              - task: ManualValidation@0
+                displayName: 'Await approval to deploy to ${{ parameters.environment }}'
+                timeoutInMinutes: 1440
+                inputs:
+                  notifyUsers: ${{ parameters.approvalNotifyUsers }}
+                  instructions: |
+                    Review and approve deployment of ${{ parameters.serviceName }} to ${{ parameters.environment }}.
+                  onTimeout: reject
+
+      - deployment: DeployWebApp
+        displayName: 'Deploy to ${{ parameters.environment }}'
+        ${{ if eq(parameters.requireApproval, true) }}:
+          dependsOn: Approval
+        environment: '${{ parameters.environment }}'
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: infra
+                  path: infra
+
+                - script: |
+                    set -euo pipefail
+                    ENV_JSON="$(Pipeline.Workspace)/infra/environments/${{ parameters.environment }}.json"
+
+                    if [ ! -f "$ENV_JSON" ]; then
+                      echo "##[warning]Expected file not found at $ENV_JSON — searching workspace for it instead:"
+                      find "$(Pipeline.Workspace)" -maxdepth 4 -type d 2>/dev/null
+                      FOUND=$(find "$(Pipeline.Workspace)" -type f -name "${{ parameters.environment }}.json" -path "*/environments/*" 2>/dev/null | head -n 1)
+                      if [ -n "$FOUND" ]; then
+                        echo "Found it at: $FOUND"
+                        ENV_JSON="$FOUND"
+                      else
+                        echo "##vso[task.logissue type=error]No environment file found anywhere under $(Pipeline.Workspace)"
+                        exit 1
+                      fi
+                    fi
+
+                    RESOURCE_GROUP=$(jq -r '.web_app.resource_group_name' "$ENV_JSON")
+                    PLAN_NAME=$(jq -r '.web_app.app_service_plan_name' "$ENV_JSON")
+                    CONTAINER_REGISTRY=$(jq -r '.web_app.container_registry' "$ENV_JSON")
+
+                    echo "Resolved from $ENV_JSON: resourceGroup=$RESOURCE_GROUP appServicePlan=$PLAN_NAME registry=$CONTAINER_REGISTRY"
+
+                    echo "##vso[task.setvariable variable=resourceGroup]$RESOURCE_GROUP"
+                    echo "##vso[task.setvariable variable=appServicePlanName]$PLAN_NAME"
+                    echo "##vso[task.setvariable variable=containerRegistry]$CONTAINER_REGISTRY"
+                  displayName: 'Resolve environment config from infra repo'
+
+                - task: AzureCLI@2
+                  displayName: 'Deploy container image to Web App'
+                  inputs:
+                    azureSubscription: '${{ parameters.azureSubscription }}'
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -euo pipefail
+
+                      FETCH_LATEST_RC_IF_BLANK="${{ parameters.fetchLatestRcIfBlank }}"
+                      RESOLVED_IMAGE_TAG="${{ parameters.imageTag }}"
+                      if [ -z "$RESOLVED_IMAGE_TAG" ] || [ "$RESOLVED_IMAGE_TAG" = "latest" ]; then
+                        if [ "$(echo "$FETCH_LATEST_RC_IF_BLANK" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+                          echo "No imageTag provided — fetching latest rc-* tag from ACR repository '${{ parameters.dockerImageName }}'..."
+                          RESOLVED_IMAGE_TAG=$(az acr repository show-tags \
+                            --name "$(containerRegistry)" \
+                            --repository "${{ parameters.dockerImageName }}" \
+                            --orderby time_desc \
+                            --output tsv \
+                            | grep '^rc-' | head -n 1 || true)
+                          if [ -z "$RESOLVED_IMAGE_TAG" ]; then
+                            echo "##vso[task.logissue type=error]No rc-* tag found in ACR repository '${{ parameters.dockerImageName }}', and no imageTag parameter was provided."
+                            exit 1
+                          fi
+                          echo "Resolved latest RC tag: $RESOLVED_IMAGE_TAG"
+                        else
+                          echo "##vso[task.logissue type=error]imageTag is required for environment '${{ parameters.environment }}'."
+                          exit 1
+                        fi
+                      fi
+
+                      echo "Deploying image tag: $RESOLVED_IMAGE_TAG"
+                      IMAGE_REF="$(containerRegistry).azurecr.io/${{ parameters.dockerImageName }}:$RESOLVED_IMAGE_TAG"
+
+                      # The App Service Plan is provisioned separately via
+                      # scripts/create-app-service-plan.sh, not by this pipeline — same pattern as
+                      # the Container Apps environment for backend deploys.
+                      if az webapp show --name "${{ parameters.webAppName }}" --resource-group "$(resourceGroup)" &> /dev/null; then
+                        echo "Web App already exists."
+                      else
+                        echo "Creating new Web App..."
+                        az webapp create \
+                          --name "${{ parameters.webAppName }}" \
+                          --resource-group "$(resourceGroup)" \
+                          --plan "$(appServicePlanName)" \
+                          --deployment-container-image-name "$IMAGE_REF"
+                        az webapp identity assign --name "${{ parameters.webAppName }}" --resource-group "$(resourceGroup)"
+                      fi
+
+                      # Confirm AcrPull every run, not just on first creation — same self-healing
+                      # rationale as backend-cd-template.yml: retries here in case a prior attempt
+                      # failed on permissions, instead of failing silently forever afterwards.
+                      echo "Confirming AcrPull role for the Web App's managed identity..."
+                      PRINCIPAL_ID=$(az webapp identity show --name "${{ parameters.webAppName }}" --resource-group "$(resourceGroup)" --query principalId -o tsv)
+                      ACR_ID=$(az acr show --name "$(containerRegistry)" --query id -o tsv)
+
+                      az role assignment create \
+                        --assignee-object-id "$PRINCIPAL_ID" \
+                        --assignee-principal-type ServicePrincipal \
+                        --role AcrPull \
+                        --scope "$ACR_ID" \
+                        || echo "Role assignment may already exist, or this identity lacks permission to grant it — continuing..."
+
+                      echo "Configuring Web App to pull via managed identity..."
+                      az webapp config set \
+                        --name "${{ parameters.webAppName }}" \
+                        --resource-group "$(resourceGroup)" \
+                        --generic-configurations '{"acrUseManagedIdentityCreds": true}'
+
+                      echo "Setting container image..."
+                      az webapp config container set \
+                        --name "${{ parameters.webAppName }}" \
+                        --resource-group "$(resourceGroup)" \
+                        --container-image-name "$IMAGE_REF" \
+                        --container-registry-url "https://$(containerRegistry).azurecr.io"
+
+                      echo "Setting app settings..."
+                      az webapp config appsettings set \
+                        --name "${{ parameters.webAppName }}" \
+                        --resource-group "$(resourceGroup)" \
+                        --settings \
+                          CELL_SERVICE_URL="${{ parameters.cellServiceUrl }}" \
+                          FUNDING_SERVICE_URL="${{ parameters.fundingServiceUrl }}" \
+                          AUDIT_SERVICE_URL="${{ parameters.auditServiceUrl }}" \
+                          AUTH_SERVICE_URL="${{ parameters.authServiceUrl }}" \
+                          DOCUMENT_SERVICE_URL="${{ parameters.documentServiceUrl }}" \
+                          WEBSITES_PORT=80
+
+                      echo "Restarting Web App to pick up the new image and settings..."
+                      az webapp restart --name "${{ parameters.webAppName }}" --resource-group "$(resourceGroup)"
