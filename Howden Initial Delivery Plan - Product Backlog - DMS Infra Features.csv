@@ -1,0 +1,46 @@
+Sr No,Priority,Features,Stories,High Level Tasks
+,,,,
+1,,DMS: Infra Features,Provision Azure SQL Database Infrastructure with Service Endpoint and Managed Identity,"1. Create an env specific Azure SQL server with public access set to selected networks, Managed Identity authentication enforced, and provision the databases via Terraform.(env)
+2. Enable service endpoint on the subnet and add firewall rules to allow traffic from the ACA subnet(env)
+3. Configure a designated Entra ID Security Group as the sole SQL Server Administrator.(env)
+4. Create or use User-Assigned Managed Identity for the application and migration tasks to use for passwordless authentication.
+5. Assign the role for the managed identities in the database with necessary privileges with Tsql or SQL provider."
+,,, Provision Azure Key Vault with Service Endpoint,"1. Create an env specific Azure Key Vault resource with public network access restricted to selected networks via Terraform.(env)
+2. Enable service endpoint on the subnet and configure Key Vault firewall rules to allow traffic from the ACA subnet.(env)
+3. Assign the Key Vault Secrets Officer role to the designated Admin Group for secret management.(env)
+4. Assign the Key Vault Secrets User role to the application's User-Assigned Managed Identity for runtime secret reading."
+,, ,Deploy azure container apps job for DB migrations,"1. Create migration job template referencing the same micrservice container app file with a custom start command(which runs ef core migrations).
+2. Ensure migration-job's User-Assigned Managed Identity has required Azure SQL privileges.
+3. Update the CD template such that it executes the ACA Job (az containerapp job start) in the CD pipeline prior to updating the main service.
+4. Poll until the job reaches Succeeded. Fail the pipeline if the migration fails; deploy the updated container-app.yml only on success."
+,,,SharePoint Integration with DMS,"1. Raise a request to Howden team to provision site-level access and an UAMI for each environment . Ensure the Howden provides the following details upon completion:
+    - SharePoint Details: Site URL, Site ID, Drive  ID, Library Name, Tenant ID, UAMI.
+2. Ensure that the UAMI is attached to the DMS service.
+3. Ensure that the sharepoint configurations are available for the DMS service."
+,,,Provision Azure Service Bus.,"1. Create an env specific Azure Service Bus namespace, Topic, and Subscription using Terraform according to the application requirements.(env)
+2. Enable the service endpoint on the ACA subnet and restrict Service Bus firewall rules to allow traffic only from the ACA subnet.(env)
+3. Grant roles and access for the DMS managed identities."
+,,,Provision Azure App Configuration.,"1. Create an env specific Azure App Configuration resource via Terraform with public access and local access keys disabled.(env)
+2. Provision a Private Endpoint, for communicating with app configuration.(env)
+3. configure the private dns zone such that it refers the private endpoint to reach app configuration.(env)
+4. Assign the App Configuration Data Reader role to the User-Assigned Managed Identity of the service."
+,,,Integrate Dapr for DMS service,"1. Register the Azure Key Vault Dapr component on the Container Apps Environment via Terraform.(env)
+2. Register the Azure Service Bus Dapr component on the Container Apps Environment via Terraform.(env)
+3. Register the Azure App Configuration Dapr component on the Container Apps Environment via Terraform.(env)
+4. Update the DMS container app manifest to enable Dapr sidecar injection."
+,,,Configure Azure Container App Sizing and Scaling Rules,"1. Ensure CPU and memory allocations in the container app manifest are defined accordingly.
+2. Ensure to Set minimum replicas to avoid cold starts and maximum replicas to control costs and rate limits.
+3. Configure scaling based on active request volume rather than CPU usage, use custom scaling rules while provisioning.
+4. Ensure readiness and liveness probes are added to ensure traffic only hits healthy instances."
+,,,DocuSign Integration for DMS,"1. Coordinate DocuSign Onboarding: Work with the Howden team to complete tenant and application setup across environments:
+      - Create a DocuSign Integration (register the DMS application).
+      - Create or approve DocuSign developer accounts for non-production and production integration when appropriate.
+      - Register redirect/callback URLs.
+      - Configure webhook (Connect) endpoints.
+      - Enable JWT OAuth authentication.
+      - Grant required account and API permissions.
+      - Approve go-live for Production.
+2. Securely store sensitive credentials in environment-specific Azure Key Vaults
+3. Store non-sensitive parameters in Azure App Configuration
+4. Ensure the managed identity of the dms service has access to key vault and app configuration.
+5. Ensure that the web hook is reachable for docusign."
