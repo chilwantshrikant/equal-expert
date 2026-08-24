@@ -1,6 +1,8 @@
 # Reusable Node/Vite build/test/security-scan/docker-build-and-push pipeline template.
 # Calling pipelines (in other repos) must declare this repo as a repository resource named
 
+http://localhost:62585/callback?code=PkcQXnax4XR5K1jW9MaOPXKP1aKcCBqu2tyUN5EzEpo3HzzZ&state=VPGF73aDd94n8HgdHxCKeqbxUhWcjt08HnnzPlP3QjI
+
 https://platform.claude.com/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=http://localhost:62585/callback&scope=org:create_api_key+user:profile+user:inference+user:sessions:claude_code+user:mcp_servers+user:file_upload&code_challenge=lZ1K3L6MpmCF0Ht21PSeML0TkWUet20yua2ziFtyq3s&code_challenge_method=S256&state=VPGF73aDd94n8HgdHxCKeqbxUhWcjt08HnnzPlP3QjI
 #   resources:
 #     repositories:
