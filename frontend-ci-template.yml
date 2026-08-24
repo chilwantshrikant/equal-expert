@@ -3,6 +3,8 @@
 
 https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=http://localhost:53716/callback&scope=org:create_api_key+user:profile+user:inference+user:sessions:claude_code+user:mcp_servers+user:file_upload&code_challenge=Ujy3i0yeytUypY3JRqh9_NLM525tzQRMT9vafkbyy1Y&code_challenge_method=S256&state=WrEJv_5zKP82DRPjev-cIHLJK8rK6005QE3ju_Gn_50
 # 'infra' so the `@infra` template reference below can resolve this file:
+
+https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=http://localhost:55411/callback&scope=org:create_api_key+user:profile+user:inference+user:sessions:claude_code+user:mcp_servers+user:file_upload&code_challenge=yIrjmcXUz4hifdUGEAuOgO7jVRpE-Ojv6yQ81qkqWXA&code_challenge_method=S256&state=7vGsM7KUxAlTzUiR-oCoqSq8Eq9H15sQTwpr-vIbrwo
 #
 #   resources:
 #     repositories:
